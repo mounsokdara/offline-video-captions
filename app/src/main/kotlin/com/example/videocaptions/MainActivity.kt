@@ -8,31 +8,44 @@ import android.media.MediaFormat
 import android.net.Uri
 import android.os.Bundle
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import java.io.File
-import java.io.FileOutputStream
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineRecognizer
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
+import com.k2fsa.sherpa.onnx.SileroVadModelConfig
+import com.k2fsa.sherpa.onnx.Vad
+import com.k2fsa.sherpa.onnx.VadModelConfig
 import java.nio.ByteOrder
 import java.util.Locale
 
 class MainActivity : Activity() {
 
-    private class Word(val text: String, val start: Double, val end: Double)
+    private class Cue(val start: Double, val end: Double, val text: String)
+
+    private val langNames = listOf(
+        "Auto-detect", "English", "Khmer", "Chinese", "Japanese", "Korean", "French",
+        "German", "Spanish", "Russian", "Arabic", "Hindi", "Thai", "Vietnamese", "Indonesian"
+    )
+    private val langCodes = listOf(
+        "", "en", "km", "zh", "ja", "ko", "fr", "de", "es", "ru", "ar", "hi", "th", "vi", "id"
+    )
 
     private lateinit var status: TextView
     private lateinit var output: TextView
     private lateinit var progress: ProgressBar
     private lateinit var pickBtn: Button
     private lateinit var saveBtn: Button
-
-    @Volatile private var model: Model? = null
+    private lateinit var langSpinner: Spinner
     private var srt = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,13 +55,17 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-        pickBtn = Button(this).apply { text = "Choose video"; isEnabled = false }
+        langSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, langNames)
+        }
+        pickBtn = Button(this).apply { text = "Choose video" }
         saveBtn = Button(this).apply { text = "Save captions (.srt)"; isEnabled = false }
-        status = TextView(this).apply { text = "Loading offline speech model..." }
+        status = TextView(this).apply { text = "Whisper AI - runs fully offline. Pick the spoken language, then a video." }
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
         output = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
         val scroll = ScrollView(this).apply { addView(output) }
 
+        root.addView(langSpinner)
         root.addView(pickBtn)
         root.addView(saveBtn)
         root.addView(status)
@@ -57,36 +74,18 @@ class MainActivity : Activity() {
         setContentView(root)
 
         pickBtn.setOnClickListener {
-            val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "video/*"
-            }
-            startActivityForResult(i, REQ_PICK)
+            }, REQ_PICK)
         }
         saveBtn.setOnClickListener {
-            val i = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "application/x-subrip"
                 putExtra(Intent.EXTRA_TITLE, "captions.srt")
-            }
-            startActivityForResult(i, REQ_SAVE)
+            }, REQ_SAVE)
         }
-
-        Thread {
-            try {
-                val dir = File(filesDir, "model")
-                val marker = File(filesDir, "model.ok")
-                if (!marker.exists()) {
-                    dir.deleteRecursively()
-                    copyAsset("model", dir)
-                    marker.writeText("ok")
-                }
-                model = Model(dir.absolutePath)
-                runOnUiThread { status.text = "Ready. Works fully offline (English)."; pickBtn.isEnabled = true }
-            } catch (e: Throwable) {
-                runOnUiThread { status.text = "Model load failed: ${e.message}" }
-            }
-        }.start()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -105,29 +104,94 @@ class MainActivity : Activity() {
     }
 
     private fun startTranscription(uri: Uri) {
+        val lang = langCodes[langSpinner.selectedItemPosition]
         pickBtn.isEnabled = false
         saveBtn.isEnabled = false
+        langSpinner.isEnabled = false
         output.text = ""
         progress.progress = 0
-        status.text = "Transcribing..."
+        status.text = "Loading AI model..."
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         Thread {
             try {
-                val words = transcribe(uri)
-                srt = buildSrt(words)
+                val cues = transcribe(uri, lang)
+                srt = buildSrt(cues)
                 runOnUiThread {
-                    output.text = if (srt.isBlank()) "(no speech detected)" else srt
-                    status.text = "Done. ${words.size} words."
+                    if (cues.isEmpty()) output.text = "(no speech detected)"
+                    status.text = "Done. ${cues.size} captions."
                     progress.progress = 1000
-                    pickBtn.isEnabled = true
-                    saveBtn.isEnabled = srt.isNotBlank()
+                    saveBtn.isEnabled = cues.isNotEmpty()
                 }
             } catch (e: Throwable) {
-                runOnUiThread { status.text = "Error: ${e.message}"; pickBtn.isEnabled = true }
+                runOnUiThread { status.text = "Error: ${e.message}" }
+            } finally {
+                runOnUiThread {
+                    pickBtn.isEnabled = true
+                    langSpinner.isEnabled = true
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
             }
         }.start()
     }
 
-    private fun transcribe(uri: Uri): List<Word> {
+    private fun transcribe(uri: Uri, lang: String): List<Cue> {
+        val rec = OfflineRecognizer(
+            assets,
+            OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
+                modelConfig = OfflineModelConfig(
+                    whisper = OfflineWhisperModelConfig(
+                        encoder = "model/encoder.int8.onnx",
+                        decoder = "model/decoder.int8.onnx",
+                        language = lang,
+                        task = "transcribe",
+                        tailPaddings = 1000,
+                    ),
+                    tokens = "model/tokens.txt",
+                    numThreads = 4,
+                    provider = "cpu",
+                    modelType = "whisper",
+                ),
+            )
+        )
+        val vad = Vad(
+            assets,
+            VadModelConfig(
+                sileroVadModelConfig = SileroVadModelConfig(
+                    model = "silero_vad.onnx",
+                    threshold = 0.5f,
+                    minSilenceDuration = 0.5f,
+                    minSpeechDuration = 0.25f,
+                    windowSize = 512,
+                    maxSpeechDuration = 25f,
+                ),
+                sampleRate = 16000,
+                numThreads = 1,
+                provider = "cpu",
+            )
+        )
+        runOnUiThread { status.text = "Transcribing..." }
+
+        val cues = ArrayList<Cue>()
+
+        fun drain() {
+            while (!vad.empty()) {
+                val seg = vad.front()
+                vad.pop()
+                val stream = rec.createStream()
+                stream.acceptWaveform(seg.samples, 16000)
+                rec.decode(stream)
+                val text = rec.getResult(stream).text.trim()
+                stream.release()
+                if (text.isNotEmpty()) {
+                    val before = cues.size
+                    addCues(seg.start / 16000.0, seg.samples.size / 16000.0, text, cues)
+                    val added = cues.subList(before, cues.size).joinToString("\n") { "[${ts(it.start)}] ${it.text}" }
+                    runOnUiThread { output.append(added + "\n") }
+                }
+            }
+        }
+
         val extractor = MediaExtractor()
         extractor.setDataSource(this, uri, null)
         var track = -1
@@ -147,10 +211,9 @@ class MainActivity : Activity() {
         codec.configure(fmt, null, null, 0)
         codec.start()
 
-        val rec = Recognizer(model, 16000f)
-        rec.setWords(true)
-        val words = ArrayList<Word>()
         val info = MediaCodec.BufferInfo()
+        val window = FloatArray(512)
+        var wn = 0
         var inputDone = false
         var outputDone = false
         var pos = 0.0
@@ -183,8 +246,6 @@ class MainActivity : Activity() {
                     sb.get(shorts)
                     val frames = total / channels
                     val step = rate / 16000.0
-                    val out = ShortArray((frames / step).toInt() + 2)
-                    var count = 0
                     while (pos + step <= frames) {
                         val s = pos.toInt()
                         val e = maxOf((pos + step).toInt(), s + 1)
@@ -193,12 +254,16 @@ class MainActivity : Activity() {
                         for (f in s until minOf(e, frames)) {
                             for (c in 0 until channels) { acc += shorts[f * channels + c]; cnt++ }
                         }
-                        out[count++] = if (cnt > 0) (acc / cnt).toShort() else 0
+                        window[wn++] = if (cnt > 0) acc.toFloat() / cnt / 32768f else 0f
+                        if (wn == 512) {
+                            vad.acceptWaveform(window.copyOf())
+                            wn = 0
+                            drain()
+                        }
                         pos += step
                     }
                     pos -= frames
                     if (pos < 0) pos = 0.0
-                    if (count > 0 && rec.acceptWaveForm(out, count)) collect(rec.result, words)
 
                     val now = System.currentTimeMillis()
                     if (durationUs > 0 && now - lastUi > 300) {
@@ -216,53 +281,55 @@ class MainActivity : Activity() {
                 pos = 0.0
             }
         }
-        collect(rec.finalResult, words)
-        rec.close()
+        vad.flush()
+        drain()
         codec.stop(); codec.release(); extractor.release()
-        return words
+        vad.release()
+        rec.release()
+        return cues
     }
 
-    private fun collect(json: String, into: MutableList<Word>) {
-        val arr = JSONObject(json).optJSONArray("result") ?: return
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            into.add(Word(o.getString("word"), o.getDouble("start"), o.getDouble("end")))
+    private fun addCues(t0: Double, dur: Double, text: String, out: MutableList<Cue>) {
+        val parts = ArrayList<String>()
+        if (text.contains(' ')) {
+            var cur = StringBuilder()
+            var n = 0
+            for (w in text.split(Regex("\\s+"))) {
+                if (cur.isNotEmpty() && (n >= 9 || cur.length + w.length > 42)) {
+                    parts.add(cur.toString()); cur = StringBuilder(); n = 0
+                }
+                if (cur.isNotEmpty()) cur.append(' ')
+                cur.append(w); n++
+            }
+            if (cur.isNotEmpty()) parts.add(cur.toString())
+        } else {
+            text.chunked(24).forEach { parts.add(it) }
+        }
+        val total = parts.sumOf { it.length }.toDouble().coerceAtLeast(1.0)
+        var t = t0
+        for (p in parts) {
+            val d = dur * p.length / total
+            out.add(Cue(t, t + d, p))
+            t += d
         }
     }
 
-    private fun buildSrt(words: List<Word>): String {
+    private fun buildSrt(cues: List<Cue>): String {
         val sb = StringBuilder()
-        var idx = 1
-        var i = 0
-        while (i < words.size) {
-            val first = words[i]
-            var j = i
-            while (j + 1 < words.size && (j - i) < 7 &&
-                words[j + 1].start - words[j].end < 0.8 &&
-                words[j + 1].end - first.start < 4.5) j++
-            val text = words.subList(i, j + 1).joinToString(" ") { it.text }
-            sb.append(idx++).append('\n')
-                .append(ts(first.start)).append(" --> ").append(ts(words[j].end)).append('\n')
-                .append(text).append("\n\n")
-            i = j + 1
+        cues.forEachIndexed { i, c ->
+            sb.append(i + 1).append('\n')
+                .append(ts(c.start, true)).append(" --> ").append(ts(c.end, true)).append('\n')
+                .append(c.text).append("\n\n")
         }
         return sb.toString()
     }
 
-    private fun ts(sec: Double): String {
+    private fun ts(sec: Double, srtFormat: Boolean = false): String {
         val ms = (sec * 1000).toLong()
-        return String.format(Locale.US, "%02d:%02d:%02d,%03d", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
-    }
-
-    private fun copyAsset(path: String, dest: File) {
-        val list = assets.list(path) ?: emptyArray()
-        if (list.isEmpty()) {
-            dest.parentFile?.mkdirs()
-            assets.open(path).use { i -> FileOutputStream(dest).use { o -> i.copyTo(o) } }
-        } else {
-            dest.mkdirs()
-            for (name in list) copyAsset("$path/$name", File(dest, name))
-        }
+        return if (srtFormat)
+            String.format(Locale.US, "%02d:%02d:%02d,%03d", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+        else
+            String.format(Locale.US, "%02d:%02d:%02d", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60)
     }
 
     companion object {

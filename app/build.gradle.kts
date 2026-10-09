@@ -11,8 +11,9 @@ android {
         applicationId = "com.example.videocaptions"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     compileOptions {
@@ -21,10 +22,5 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 
-    androidResources { noCompress += listOf("mdl", "fst", "conf", "int", "mat", "stats", "dubm", "ie", "txt") }
-}
-
-dependencies {
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
-    implementation("com.alphacephei:vosk-android:0.3.47")
+    androidResources { noCompress += listOf("onnx") }
 }
