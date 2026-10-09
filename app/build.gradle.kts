@@ -11,9 +11,17 @@ android {
         applicationId = "com.example.videocaptions"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "4.0"
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        versionCode = 5
+        versionName = "5.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 
     compileOptions {
@@ -22,5 +30,10 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 
-    androidResources { noCompress += listOf("onnx") }
+    dependenciesInfo { includeInApk = false; includeInBundle = false }
+    packaging {
+        resources {
+            excludes += listOf("/META-INF/**", "/kotlin/**", "**.kotlin_builtins", "DebugProbesKt.bin", "kotlin-tooling-metadata.json")
+        }
+    }
 }

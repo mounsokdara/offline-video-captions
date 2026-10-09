@@ -1,22 +1,21 @@
 package com.example.videocaptions
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
-import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
-import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.k2fsa.sherpa.onnx.FeatureConfig
@@ -39,10 +38,9 @@ class MainActivity : Activity() {
 
     private class Cue(val start: Double, val end: Double, val text: String)
 
-    private val modelNames = listOf("Whisper Base (~100 MB, faster)", "Whisper Small (~350 MB, most accurate)")
+    private val repoUrl = "https://github.com/mounsokdara/offline-video-captions/releases/download/"
+    private val modelNames = listOf("Whisper Base (~160 MB, faster)", "Whisper Small (~375 MB, most accurate)")
     private val modelIds = listOf("base", "small")
-    private val modelBaseUrl = "https://github.com/mounsokdara/offline-video-captions/releases/download/models/"
-
     private val langNames = listOf(
         "Auto-detect", "English", "Khmer", "Chinese", "Japanese", "Korean", "French",
         "German", "Spanish", "Russian", "Arabic", "Hindi", "Thai", "Vietnamese", "Indonesian"
@@ -54,44 +52,65 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var output: TextView
     private lateinit var progress: ProgressBar
+    private lateinit var modelBtn: Button
+    private lateinit var langBtn: Button
     private lateinit var pickBtn: Button
     private lateinit var saveBtn: Button
-    private lateinit var langSpinner: Spinner
-    private lateinit var modelSpinner: Spinner
+    private lateinit var cleanBtn: Button
+    private var modelIdx = 0
+    private var langIdx = 0
     private var srt = ""
+    private var nativeLoaded = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val pad = (16 * resources.displayMetrics.density).toInt()
+        val d = resources.displayMetrics.density
+        val pad = (14 * d).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-        modelSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modelNames)
-        }
-        langSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, langNames)
-        }
-        pickBtn = Button(this).apply { text = "Choose video" }
-        saveBtn = Button(this).apply { text = "Save captions (.srt)"; isEnabled = false }
-        status = TextView(this).apply { text = "Whisper AI. The model downloads once (needs internet), then everything runs offline. Pick model and spoken language, then a video." }
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-        output = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
-        val scroll = ScrollView(this).apply { addView(output) }
+        fun button(t: String) = Button(this).apply { text = t; isAllCaps = false }
 
-        root.addView(header("Model"))
-        root.addView(modelSpinner)
-        root.addView(header("Spoken language"))
-        root.addView(langSpinner)
-        root.addView(header("Video"))
-        root.addView(pickBtn)
-        root.addView(saveBtn)
+        val intro = TextView(this).apply {
+            text = "Welcome! Now you need to:"
+            textSize = 18f
+            setPadding((4 * d).toInt(), 0, 0, (6 * d).toInt())
+        }
+        modelBtn = button("")
+        langBtn = button("")
+        pickBtn = button("3. Choose video (make captions)")
+        saveBtn = button("Save captions (.srt)").apply { isEnabled = false }
+        cleanBtn = button("Delete downloaded data")
+        status = TextView(this).apply {
+            text = "AI model downloads once (internet needed), then works offline."
+            setPadding((4 * d).toInt(), (10 * d).toInt(), 0, (4 * d).toInt())
+        }
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+        output = TextView(this).apply {
+            hint = "Captions appear here."
+            textSize = 17f
+            setTextColor(Color.parseColor("#222222"))
+            setHintTextColor(Color.parseColor("#777777"))
+            setBackgroundColor(Color.parseColor("#F2F2F2"))
+            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
+            minHeight = (140 * d).toInt()
+            setTextIsSelectable(true)
+        }
+        refreshLabels()
+
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = (2 * d).toInt() }
+        root.addView(intro)
+        for (b in listOf(modelBtn, langBtn, pickBtn, saveBtn, cleanBtn)) root.addView(b, lp)
         root.addView(status)
         root.addView(progress)
-        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        setContentView(root)
+        root.addView(output, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = (8 * d).toInt() })
+        setContentView(ScrollView(this).apply { addView(root) })
 
+        modelBtn.setOnClickListener { choose("Model", modelNames, modelIdx) { modelIdx = it; refreshLabels() } }
+        langBtn.setOnClickListener { choose("Spoken language", langNames, langIdx) { langIdx = it; refreshLabels() } }
         pickBtn.setOnClickListener {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
@@ -105,6 +124,33 @@ class MainActivity : Activity() {
                 putExtra(Intent.EXTRA_TITLE, "captions.srt")
             }, REQ_SAVE)
         }
+        cleanBtn.setOnClickListener {
+            AlertDialog.Builder(this).setTitle("Delete downloaded data?")
+                .setMessage("Removes the downloaded AI model and runtime. They will be downloaded again when needed.")
+                .setPositiveButton("Delete") { _, _ ->
+                    filesDir.listFiles()?.forEach { it.deleteRecursively() }
+                    Toast.makeText(this, "Deleted", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("Cancel", null).show()
+        }
+    }
+
+    private fun refreshLabels() {
+        modelBtn.text = "1. Model: ${modelNames[modelIdx].substringBefore(" (")}"
+        langBtn.text = "2. Spoken language: ${langNames[langIdx]}"
+    }
+
+    private fun choose(title: String, items: List<String>, current: Int, onPick: (Int) -> Unit) {
+        AlertDialog.Builder(this).setTitle(title)
+            .setSingleChoiceItems(items.toTypedArray(), current) { dlg, which -> onPick(which); dlg.dismiss() }
+            .show()
+    }
+
+    private fun setBusy(busy: Boolean) {
+        for (b in listOf(modelBtn, langBtn, pickBtn, cleanBtn)) b.isEnabled = !busy
+        if (busy) saveBtn.isEnabled = false
+        if (busy) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -123,18 +169,15 @@ class MainActivity : Activity() {
     }
 
     private fun startTranscription(uri: Uri) {
-        val lang = langCodes[langSpinner.selectedItemPosition]
-        val modelName = modelIds[modelSpinner.selectedItemPosition]
-        pickBtn.isEnabled = false
-        saveBtn.isEnabled = false
-        langSpinner.isEnabled = false
-        modelSpinner.isEnabled = false
+        val lang = langCodes[langIdx]
+        val modelName = modelIds[modelIdx]
+        setBusy(true)
         output.text = ""
         progress.progress = 0
-        status.text = "Preparing AI model..."
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        status.text = "Preparing..."
         Thread {
             try {
+                ensureRuntime()
                 val dir = ensureModel(modelName)
                 val cues = transcribe(uri, lang, dir)
                 srt = buildSrt(cues)
@@ -142,22 +185,91 @@ class MainActivity : Activity() {
                     if (cues.isEmpty()) output.text = "(no speech detected)"
                     status.text = "Done. ${cues.size} captions."
                     progress.progress = 1000
-                    saveBtn.isEnabled = cues.isNotEmpty()
                 }
             } catch (e: Throwable) {
                 runOnUiThread { status.text = "Error: ${e.message}" }
             } finally {
                 runOnUiThread {
-                    pickBtn.isEnabled = true
-                    langSpinner.isEnabled = true
-                    modelSpinner.isEnabled = true
-                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    setBusy(false)
+                    saveBtn.isEnabled = srt.isNotBlank()
                 }
             }
         }.start()
     }
 
+    // ---- downloads -------------------------------------------------------------------------
+
+    private fun ensureRuntime() {
+        val abi = Build.SUPPORTED_ABIS.firstOrNull { it in setOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+            ?: throw IllegalStateException("Unsupported CPU: ${Build.SUPPORTED_ABIS.joinToString()}")
+        val dir = File(filesDir, "runtime-$abi").apply { mkdirs() }
+        val ort = File(dir, "libonnxruntime.so")
+        val jni = File(dir, "libsherpa-onnx-jni.so")
+        download(repoUrl + "runtime/$abi-libonnxruntime.so", ort, "AI runtime 1/3")
+        download(repoUrl + "runtime/$abi-libsherpa-onnx-jni.so", jni, "AI runtime 2/3")
+        download(repoUrl + "runtime/silero_vad.onnx", File(filesDir, "silero_vad.onnx"), "voice detector 3/3")
+        if (!nativeLoaded) {
+            System.load(ort.path)
+            System.load(jni.path)
+            nativeLoaded = true
+        }
+    }
+
+    private fun ensureModel(name: String): File {
+        val dir = File(filesDir, "whisper-$name").apply { mkdirs() }
+        for (f in listOf("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")) {
+            download(repoUrl + "models/whisper-$name-" + f, File(dir, f), "$name $f")
+        }
+        return dir
+    }
+
+    private fun download(url: String, dest: File, label: String) {
+        if (dest.exists()) return
+        val part = File(dest.path + ".part")
+        var existing = if (part.exists()) part.length() else 0L
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 20_000
+        conn.readTimeout = 30_000
+        if (existing > 0) conn.setRequestProperty("Range", "bytes=$existing-")
+        conn.connect()
+        val code = conn.responseCode
+        if (code == 416) { part.renameTo(dest); return }
+        if (code != 200 && code != 206) throw IOException("Download failed (HTTP $code). Check your internet connection.")
+        val append = code == 206
+        if (!append) existing = 0
+        val remaining = conn.contentLengthLong
+        val total = if (remaining > 0) existing + remaining else -1L
+        var done = existing
+        var lastUi = 0L
+        FileOutputStream(part, append).use { out ->
+            conn.inputStream.use { inp ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastUi > 300) {
+                        lastUi = now
+                        val mb = done / 1_048_576
+                        val msg = if (total > 0) "Downloading $label: $mb / ${total / 1_048_576} MB" else "Downloading $label: $mb MB"
+                        val p = if (total > 0) (done * 1000 / total).toInt().coerceIn(0, 1000) else 0
+                        runOnUiThread { status.text = msg; progress.progress = p }
+                    }
+                }
+            }
+        }
+        if (total > 0 && part.length() != total) throw IOException("Download interrupted. Tap again to resume.")
+        if (!part.renameTo(dest)) throw IOException("Could not save file")
+        if (dest.name.endsWith(".so")) dest.setReadOnly()
+        runOnUiThread { progress.progress = 0 }
+    }
+
+    // ---- transcription ---------------------------------------------------------------------
+
     private fun transcribe(uri: Uri, lang: String, modelDir: File): List<Cue> {
+        runOnUiThread { status.text = "Loading AI model..." }
         val rec = OfflineRecognizer(
             config = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
@@ -177,10 +289,9 @@ class MainActivity : Activity() {
             )
         )
         val vad = Vad(
-            assets,
-            VadModelConfig(
+            config = VadModelConfig(
                 sileroVadModelConfig = SileroVadModelConfig(
-                    model = "silero_vad.onnx",
+                    model = File(filesDir, "silero_vad.onnx").path,
                     threshold = 0.5f,
                     minSilenceDuration = 0.5f,
                     minSpeechDuration = 0.25f,
@@ -234,7 +345,7 @@ class MainActivity : Activity() {
         codec.start()
 
         val info = MediaCodec.BufferInfo()
-        val window = FloatArray(512)
+        val win = FloatArray(512)
         var wn = 0
         var inputDone = false
         var outputDone = false
@@ -276,9 +387,9 @@ class MainActivity : Activity() {
                         for (f in s until minOf(e, frames)) {
                             for (c in 0 until channels) { acc += shorts[f * channels + c]; cnt++ }
                         }
-                        window[wn++] = if (cnt > 0) acc.toFloat() / cnt / 32768f else 0f
+                        win[wn++] = if (cnt > 0) acc.toFloat() / cnt / 32768f else 0f
                         if (wn == 512) {
-                            vad.acceptWaveform(window.copyOf())
+                            vad.acceptWaveform(win.copyOf())
                             wn = 0
                             drain()
                         }
@@ -311,78 +422,6 @@ class MainActivity : Activity() {
         return cues
     }
 
-    // Classic Holo section header: small blue caps label with a thin blue rule.
-    private fun header(title: String): LinearLayout {
-        val d = resources.displayMetrics.density
-        val holoBlue = Color.parseColor("#33B5E5")
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, (12 * d).toInt(), 0, (4 * d).toInt())
-            addView(TextView(this@MainActivity).apply {
-                text = title.uppercase(Locale.getDefault())
-                textSize = 13f
-                setTextColor(holoBlue)
-                setPadding((4 * d).toInt(), 0, 0, (2 * d).toInt())
-            })
-            addView(View(this@MainActivity).apply { setBackgroundColor(holoBlue) },
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (2 * d).toInt()))
-        }
-    }
-
-    private fun ensureModel(name: String): File {
-        val dir = File(filesDir, "whisper-$name")
-        dir.mkdirs()
-        val files = listOf(
-            "encoder.int8.onnx" to "whisper-$name-encoder.int8.onnx",
-            "decoder.int8.onnx" to "whisper-$name-decoder.int8.onnx",
-            "tokens.txt" to "whisper-$name-tokens.txt",
-        )
-        for ((local, remote) in files) download(modelBaseUrl + remote, File(dir, local), local)
-        return dir
-    }
-
-    private fun download(url: String, dest: File, label: String) {
-        if (dest.exists()) return
-        val part = File(dest.path + ".part")
-        var existing = if (part.exists()) part.length() else 0L
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 20_000
-        conn.readTimeout = 30_000
-        if (existing > 0) conn.setRequestProperty("Range", "bytes=$existing-")
-        conn.connect()
-        val code = conn.responseCode
-        if (code == 416) { part.renameTo(dest); return }
-        if (code != 200 && code != 206) throw IOException("Model download failed (HTTP $code). Check your internet connection.")
-        val append = code == 206
-        if (!append) existing = 0
-        val remaining = conn.contentLengthLong
-        val total = if (remaining > 0) existing + remaining else -1L
-        var done = existing
-        var lastUi = 0L
-        FileOutputStream(part, append).use { out ->
-            conn.inputStream.use { inp ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = inp.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    done += n
-                    val now = System.currentTimeMillis()
-                    if (now - lastUi > 300) {
-                        lastUi = now
-                        val mb = done / 1_048_576
-                        val msg = if (total > 0) "Downloading $label: $mb / ${total / 1_048_576} MB" else "Downloading $label: $mb MB"
-                        val p = if (total > 0) (done * 1000 / total).toInt().coerceIn(0, 1000) else 0
-                        runOnUiThread { status.text = msg; progress.progress = p }
-                    }
-                }
-            }
-        }
-        if (total > 0 && part.length() != total) throw IOException("Download interrupted. Tap Choose video again to resume.")
-        if (!part.renameTo(dest)) throw IOException("Could not save model file")
-        runOnUiThread { progress.progress = 0 }
-    }
-
     private fun addCues(t0: Double, dur: Double, text: String, out: MutableList<Cue>) {
         val parts = ArrayList<String>()
         if (text.contains(' ')) {
@@ -402,9 +441,9 @@ class MainActivity : Activity() {
         val total = parts.sumOf { it.length }.toDouble().coerceAtLeast(1.0)
         var t = t0
         for (p in parts) {
-            val d = dur * p.length / total
-            out.add(Cue(t, t + d, p))
-            t += d
+            val dd = dur * p.length / total
+            out.add(Cue(t, t + dd, p))
+            t += dd
         }
     }
 

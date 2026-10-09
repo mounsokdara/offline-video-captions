@@ -36,7 +36,7 @@ class OfflineStream(var ptr: Long) {
 
     companion object {
         init {
-            System.loadLibrary("sherpa-onnx-jni")
+            // native library is downloaded and loaded by MainActivity
         }
     }
 }

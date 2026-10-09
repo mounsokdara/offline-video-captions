@@ -5,7 +5,7 @@
     <application
         android:label="Video Captions"
         android:largeHeap="true"
-        android:theme="@android:style/Theme.Holo.Light.DarkActionBar">
+        android:theme="@android:style/Theme.Black">
         <activity
             android:name=".MainActivity"
             android:exported="true">
