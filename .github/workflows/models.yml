@@ -1,0 +1,41 @@
+name: Publish Whisper models
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure models release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view models --repo ${{ github.repository }} >/dev/null 2>&1 || \
+          gh release create models --repo ${{ github.repository }} --latest=false \
+            --title "Whisper models (downloaded by the app)" --notes "int8 Whisper models from k2-fsa/sherpa-onnx, fetched by the app on first use."
+
+  upload:
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [base, small]
+    steps:
+      - name: Download and upload ${{ matrix.model }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          M=${{ matrix.model }}
+          curl -sL -o m.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-$M.tar.bz2
+          tar xjf m.tar.bz2
+          D=sherpa-onnx-whisper-$M
+          mkdir out
+          cp $D/*-encoder.int8.onnx out/whisper-$M-encoder.int8.onnx
+          cp $D/*-decoder.int8.onnx out/whisper-$M-decoder.int8.onnx
+          cp $D/*-tokens.txt out/whisper-$M-tokens.txt
+          ls -la out
+          gh release upload models out/* --clobber --repo ${{ github.repository }}

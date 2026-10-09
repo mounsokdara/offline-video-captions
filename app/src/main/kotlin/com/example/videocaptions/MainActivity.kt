@@ -25,12 +25,21 @@ import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteOrder
 import java.util.Locale
 
 class MainActivity : Activity() {
 
     private class Cue(val start: Double, val end: Double, val text: String)
+
+    private val modelNames = listOf("Whisper Base (~100 MB, faster)", "Whisper Small (~350 MB, most accurate)")
+    private val modelIds = listOf("base", "small")
+    private val modelBaseUrl = "https://github.com/mounsokdara/offline-video-captions/releases/download/models/"
 
     private val langNames = listOf(
         "Auto-detect", "English", "Khmer", "Chinese", "Japanese", "Korean", "French",
@@ -46,6 +55,7 @@ class MainActivity : Activity() {
     private lateinit var pickBtn: Button
     private lateinit var saveBtn: Button
     private lateinit var langSpinner: Spinner
+    private lateinit var modelSpinner: Spinner
     private var srt = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,16 +65,20 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
+        modelSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modelNames)
+        }
         langSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, langNames)
         }
         pickBtn = Button(this).apply { text = "Choose video" }
         saveBtn = Button(this).apply { text = "Save captions (.srt)"; isEnabled = false }
-        status = TextView(this).apply { text = "Whisper AI - runs fully offline. Pick the spoken language, then a video." }
+        status = TextView(this).apply { text = "Whisper AI. The model downloads once (needs internet), then everything runs offline. Pick model and spoken language, then a video." }
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
         output = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
         val scroll = ScrollView(this).apply { addView(output) }
 
+        root.addView(modelSpinner)
         root.addView(langSpinner)
         root.addView(pickBtn)
         root.addView(saveBtn)
@@ -105,16 +119,19 @@ class MainActivity : Activity() {
 
     private fun startTranscription(uri: Uri) {
         val lang = langCodes[langSpinner.selectedItemPosition]
+        val modelName = modelIds[modelSpinner.selectedItemPosition]
         pickBtn.isEnabled = false
         saveBtn.isEnabled = false
         langSpinner.isEnabled = false
+        modelSpinner.isEnabled = false
         output.text = ""
         progress.progress = 0
-        status.text = "Loading AI model..."
+        status.text = "Preparing AI model..."
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         Thread {
             try {
-                val cues = transcribe(uri, lang)
+                val dir = ensureModel(modelName)
+                val cues = transcribe(uri, lang, dir)
                 srt = buildSrt(cues)
                 runOnUiThread {
                     if (cues.isEmpty()) output.text = "(no speech detected)"
@@ -128,26 +145,26 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     pickBtn.isEnabled = true
                     langSpinner.isEnabled = true
+                    modelSpinner.isEnabled = true
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
             }
         }.start()
     }
 
-    private fun transcribe(uri: Uri, lang: String): List<Cue> {
+    private fun transcribe(uri: Uri, lang: String, modelDir: File): List<Cue> {
         val rec = OfflineRecognizer(
-            assets,
-            OfflineRecognizerConfig(
+            config = OfflineRecognizerConfig(
                 featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
                 modelConfig = OfflineModelConfig(
                     whisper = OfflineWhisperModelConfig(
-                        encoder = "model/encoder.int8.onnx",
-                        decoder = "model/decoder.int8.onnx",
+                        encoder = File(modelDir, "encoder.int8.onnx").path,
+                        decoder = File(modelDir, "decoder.int8.onnx").path,
                         language = lang,
                         task = "transcribe",
                         tailPaddings = 1000,
                     ),
-                    tokens = "model/tokens.txt",
+                    tokens = File(modelDir, "tokens.txt").path,
                     numThreads = 4,
                     provider = "cpu",
                     modelType = "whisper",
@@ -287,6 +304,60 @@ class MainActivity : Activity() {
         vad.release()
         rec.release()
         return cues
+    }
+
+    private fun ensureModel(name: String): File {
+        val dir = File(filesDir, "whisper-$name")
+        dir.mkdirs()
+        val files = listOf(
+            "encoder.int8.onnx" to "whisper-$name-encoder.int8.onnx",
+            "decoder.int8.onnx" to "whisper-$name-decoder.int8.onnx",
+            "tokens.txt" to "whisper-$name-tokens.txt",
+        )
+        for ((local, remote) in files) download(modelBaseUrl + remote, File(dir, local), local)
+        return dir
+    }
+
+    private fun download(url: String, dest: File, label: String) {
+        if (dest.exists()) return
+        val part = File(dest.path + ".part")
+        var existing = if (part.exists()) part.length() else 0L
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 20_000
+        conn.readTimeout = 30_000
+        if (existing > 0) conn.setRequestProperty("Range", "bytes=$existing-")
+        conn.connect()
+        val code = conn.responseCode
+        if (code == 416) { part.renameTo(dest); return }
+        if (code != 200 && code != 206) throw IOException("Model download failed (HTTP $code). Check your internet connection.")
+        val append = code == 206
+        if (!append) existing = 0
+        val remaining = conn.contentLengthLong
+        val total = if (remaining > 0) existing + remaining else -1L
+        var done = existing
+        var lastUi = 0L
+        FileOutputStream(part, append).use { out ->
+            conn.inputStream.use { inp ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastUi > 300) {
+                        lastUi = now
+                        val mb = done / 1_048_576
+                        val msg = if (total > 0) "Downloading $label: $mb / ${total / 1_048_576} MB" else "Downloading $label: $mb MB"
+                        val p = if (total > 0) (done * 1000 / total).toInt().coerceIn(0, 1000) else 0
+                        runOnUiThread { status.text = msg; progress.progress = p }
+                    }
+                }
+            }
+        }
+        if (total > 0 && part.length() != total) throw IOException("Download interrupted. Tap Choose video again to resume.")
+        if (!part.renameTo(dest)) throw IOException("Could not save model file")
+        runOnUiThread { progress.progress = 0 }
     }
 
     private fun addCues(t0: Double, dur: Double, text: String, out: MutableList<Cue>) {
