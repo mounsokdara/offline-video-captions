@@ -6,7 +6,9 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.graphics.Color
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.ArrayAdapter
@@ -78,8 +80,11 @@ class MainActivity : Activity() {
         output = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
         val scroll = ScrollView(this).apply { addView(output) }
 
+        root.addView(header("Model"))
         root.addView(modelSpinner)
+        root.addView(header("Spoken language"))
         root.addView(langSpinner)
+        root.addView(header("Video"))
         root.addView(pickBtn)
         root.addView(saveBtn)
         root.addView(status)
@@ -304,6 +309,24 @@ class MainActivity : Activity() {
         vad.release()
         rec.release()
         return cues
+    }
+
+    // Classic Holo section header: small blue caps label with a thin blue rule.
+    private fun header(title: String): LinearLayout {
+        val d = resources.displayMetrics.density
+        val holoBlue = Color.parseColor("#33B5E5")
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, (12 * d).toInt(), 0, (4 * d).toInt())
+            addView(TextView(this@MainActivity).apply {
+                text = title.uppercase(Locale.getDefault())
+                textSize = 13f
+                setTextColor(holoBlue)
+                setPadding((4 * d).toInt(), 0, 0, (2 * d).toInt())
+            })
+            addView(View(this@MainActivity).apply { setBackgroundColor(holoBlue) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (2 * d).toInt()))
+        }
     }
 
     private fun ensureModel(name: String): File {
